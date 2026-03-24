@@ -718,4 +718,52 @@ mod tests {
         let result = client.try_execute(&executor, &pid);
         assert_eq!(result, Err(Ok(GovernorError::TimelockNotElapsed)));
     }
+
+    #[test]
+    fn test_has_voted_returns_true_for_voter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        // Voter has not voted yet
+        assert_eq!(client.has_voted(&pid, &voter), false);
+
+        // Cast vote
+        client.vote(&voter, &pid, &true, &100);
+
+        // Now voter has voted
+        assert_eq!(client.has_voted(&pid, &voter), true);
+    }
+
+    #[test]
+    fn test_has_voted_returns_false_for_non_voter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let non_voter = Address::generate(&env);
+
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        // non_voter has not participated at all
+        assert_eq!(client.has_voted(&pid, &non_voter), false);
+
+        // voter votes
+        client.vote(&voter, &pid, &true, &100);
+
+        // non_voter still has not voted
+        assert_eq!(client.has_voted(&pid, &non_voter), false);
+
+        // voter has voted
+        assert_eq!(client.has_voted(&pid, &voter), true);
+    }
 }
