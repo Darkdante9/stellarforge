@@ -10,7 +10,8 @@
 //! - Timelock between approval and execution
 //! - Anyone can propose; execution is permissionless once passed
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -430,6 +431,29 @@ impl GovernorContract {
         env.storage().instance().get(&DataKey::Config)
     }
 
+    /// Return the total number of proposals that have been created.
+    ///
+    /// Read-only; does not modify state. Useful for UIs to paginate and list
+    /// all proposals without tracking events off-chain.
+    ///
+    /// # Returns
+    /// `u64` — the total count of proposals created since contract initialization.
+    ///
+    /// # Example
+    /// ```text
+    /// let count = client.get_proposal_count();
+    /// for id in 0..count {
+    ///     let proposal = client.get_proposal(&id);
+    ///     // process proposal...
+    /// }
+    /// ```
+    pub fn get_proposal_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextProposalId)
+            .unwrap_or(0u64)
+    }
+
     /// Check whether an address has already voted on a proposal.
     ///
     /// Read-only; does not modify state. Useful for UIs and integrations to
@@ -453,6 +477,53 @@ impl GovernorContract {
             .persistent()
             .has(&DataKey::Vote(proposal_id, voter))
     }
+
+    /// Return the IDs of all proposals that are currently in the active voting period.
+    ///
+    /// A proposal is considered pending if its [`ProposalState`] is [`ProposalState::Active`]
+    /// **and** the current ledger timestamp has not yet passed its `vote_end`. Proposals that
+    /// have been finalized, executed, or cancelled — or whose voting window has simply expired
+    /// without being finalized — are excluded.
+    ///
+    /// Read-only; does not modify state. Intended for governance UIs that need to enumerate
+    /// active proposals without off-chain indexing.
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of proposal IDs open for voting, in ascending ID order.
+    /// Returns an empty vector when no proposals are currently pending.
+    ///
+    /// # Example
+    /// ```text
+    /// let pending = client.get_pending_proposals();
+    /// for id in pending.iter() {
+    ///     let p = client.get_proposal(&id)?;
+    ///     println!("Active: {} (ends {})", p.title, p.vote_end);
+    /// }
+    /// ```
+    pub fn get_pending_proposals(env: Env) -> Vec<u64> {
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextProposalId)
+            .unwrap_or(0u64);
+
+        let now = env.ledger().timestamp();
+        let mut pending = Vec::new(&env);
+
+        for id in 0..next_id {
+            if let Some(proposal) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Proposal>(&DataKey::Proposal(id))
+            {
+                if proposal.state == ProposalState::Active && now <= proposal.vote_end {
+                    pending.push_back(id);
+                }
+            }
+        }
+
+        pending
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -466,7 +537,8 @@ mod tests {
         Env, String,
     };
 
-    fn setup(env: &Env) -> GovernorContractClient {
+    fn setup(env: &Env) -> GovernorContractClient<'_> {
+    fn setup<'a>(env: &'a Env) -> GovernorContractClient<'a> {
         let contract_id = env.register_contract(None, GovernorContract);
         let client = GovernorContractClient::new(env, &contract_id);
         let token = Address::generate(env);
@@ -490,12 +562,55 @@ mod tests {
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
-        let pid = client.propose(&proposer, &String::from_str(&env, "Test Proposal"), &String::from_str(&env, "A test"));
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A test"),
+        );
         client.vote(&voter, &pid, &true, &200);
 
         env.ledger().with_mut(|l| l.timestamp = 5000);
         let state = client.finalize(&pid);
         assert_eq!(state, ProposalState::Passed);
+    }
+
+    #[test]
+    fn test_proposal_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let client = setup(&env);
+
+        // Initially, no proposals exist
+        assert_eq!(client.get_proposal_count(), 0);
+
+        // Create first proposal
+        let proposer = Address::generate(&env);
+        let pid1 = client.propose(
+            &proposer,
+            &String::from_str(&env, "First Proposal"),
+            &String::from_str(&env, "First description"),
+        );
+        assert_eq!(pid1, 0);
+        assert_eq!(client.get_proposal_count(), 1);
+
+        // Create second proposal
+        let pid2 = client.propose(
+            &proposer,
+            &String::from_str(&env, "Second Proposal"),
+            &String::from_str(&env, "Second description"),
+        );
+        assert_eq!(pid2, 1);
+        assert_eq!(client.get_proposal_count(), 2);
+
+        // Create third proposal
+        let pid3 = client.propose(
+            &proposer,
+            &String::from_str(&env, "Third Proposal"),
+            &String::from_str(&env, "Third description"),
+        );
+        assert_eq!(pid3, 2);
+        assert_eq!(client.get_proposal_count(), 3);
     }
 
     #[test]
@@ -506,7 +621,11 @@ mod tests {
         let client = setup(&env);
 
         let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "Low vote"), &String::from_str(&env, "desc"));
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "Low vote"),
+            &String::from_str(&env, "desc"),
+        );
 
         let voter = Address::generate(&env);
         client.vote(&voter, &pid, &true, &50);
@@ -525,7 +644,11 @@ mod tests {
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
 
         client.vote(&voter, &pid, &true, &100);
         let result = client.try_vote(&voter, &pid, &true, &100);
@@ -572,7 +695,11 @@ mod tests {
         let client = setup(&env);
 
         let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
 
         // Vote with weight below quorum (quorum = 100)
         let voter = Address::generate(&env);
@@ -591,80 +718,11 @@ mod tests {
         let client = setup(&env);
 
         let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
-
-        let voter = Address::generate(&env);
-        client.vote(&voter, &pid, &true, &100);
-
-        env.ledger().with_mut(|l| l.timestamp = 5000);
-        let state = client.finalize(&pid);
-        assert_eq!(state, ProposalState::Passed);
-    }
-
-    #[test]
-    fn test_execute_failed_proposal_reverts() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
-
-        let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
-
-        env.ledger().with_mut(|l| l.timestamp = 5000);
-        client.finalize(&pid); // fails: no votes
-
-        let executor = Address::generate(&env);
-        let result = client.try_execute(&executor, &pid);
-        assert!(matches!(result, Err(Ok(GovernorError::ProposalNotPassed))));
-    }
-
-    #[test]
-    fn test_vote_after_voting_period_reverts() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
-
-        let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
-
-        // Advance past voting_period (3600)
-        env.ledger().with_mut(|l| l.timestamp = 5000);
-
-        let voter = Address::generate(&env);
-        let result = client.try_vote(&voter, &pid, &true, &100);
-        assert!(matches!(result, Err(Ok(GovernorError::VotingClosed))));
-    }
-
-    #[test]
-    fn test_finalize_fails_when_quorum_not_reached() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
-
-        let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
-
-        // Vote with weight below quorum (quorum = 100)
-        let voter = Address::generate(&env);
-        client.vote(&voter, &pid, &true, &50);
-
-        env.ledger().with_mut(|l| l.timestamp = 5000);
-        let state = client.finalize(&pid);
-        assert_eq!(state, ProposalState::Failed);
-    }
-
-    #[test]
-    fn test_finalize_passes_when_quorum_met_and_majority_yes() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
-
-        let proposer = Address::generate(&env);
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
 
         let voter = Address::generate(&env);
         client.vote(&voter, &pid, &true, &100);
@@ -728,5 +786,158 @@ mod tests {
 
         let result = client.try_execute(&executor, &pid);
         assert_eq!(result, Err(Ok(GovernorError::TimelockNotElapsed)));
+    }
+
+    #[test]
+    fn test_has_voted_returns_true_for_voter() {
+    fn test_get_pending_proposals_empty_when_none_exist() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let client = setup(&env);
+
+        let pending = client.get_pending_proposals();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn test_get_pending_proposals_returns_active_ids() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let pid0 = client.propose(&proposer, &String::from_str(&env, "P0"), &String::from_str(&env, "D"));
+        let pid1 = client.propose(&proposer, &String::from_str(&env, "P1"), &String::from_str(&env, "D"));
+
+        // Both proposals are active within the voting period
+        let pending = client.get_pending_proposals();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get(0).unwrap(), pid0);
+        assert_eq!(pending.get(1).unwrap(), pid1);
+    }
+
+    #[test]
+    fn test_get_pending_proposals_excludes_finalized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        // Voter has not voted yet
+        assert_eq!(client.has_voted(&pid, &voter), false);
+
+        // Cast vote
+        client.vote(&voter, &pid, &true, &100);
+
+        // Now voter has voted
+        assert_eq!(client.has_voted(&pid, &voter), true);
+    }
+
+    #[test]
+    fn test_has_voted_returns_false_for_non_voter() {
+        // pid0: will be finalized (passed)
+        let pid0 = client.propose(&proposer, &String::from_str(&env, "P0"), &String::from_str(&env, "D"));
+        client.vote(&voter, &pid0, &true, &200);
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        // pid1: will remain active but its voting window also expires at t=5000
+        let _pid1 = client.propose(&proposer, &String::from_str(&env, "P1"), &String::from_str(&env, "D"));
+
+        // Advance past voting period and finalize pid0
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        client.finalize(&pid0);
+
+        // pid1 was created at t=0, vote_end = 3600, current time is 5000 → also expired but not finalized
+        // Only proposals with state==Active AND now<=vote_end are returned
+        let pending = client.get_pending_proposals();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn test_get_pending_proposals_excludes_expired_but_not_finalized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let non_voter = Address::generate(&env);
+
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        // non_voter has not participated at all
+        assert_eq!(client.has_voted(&pid, &non_voter), false);
+
+        // voter votes
+        client.vote(&voter, &pid, &true, &100);
+
+        // non_voter still has not voted
+        assert_eq!(client.has_voted(&pid, &non_voter), false);
+
+        // voter has voted
+        assert_eq!(client.has_voted(&pid, &voter), true);
+    }
+}
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        // Advance past voting_period without finalizing
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+
+        // State is still Active but vote_end has passed — should not be returned
+        let pending = client.get_pending_proposals();
+        assert_eq!(pending.len(), 0);
+        // Confirm the proposal still exists
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.state, ProposalState::Active);
+    }
+
+    #[test]
+    fn test_get_pending_proposals_mixed_states() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        // pid0: finalized (passed) at t=5000
+        let pid0 = client.propose(&proposer, &String::from_str(&env, "P0"), &String::from_str(&env, "D"));
+        client.vote(&voter, &pid0, &true, &200);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+        client.vote(&voter, &pid, &true, &200);
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        client.finalize(&pid0);
+
+        // pid1 and pid2 proposed after the advance — still in voting window
+        let pid1 = client.propose(&proposer, &String::from_str(&env, "P1"), &String::from_str(&env, "D"));
+        let pid2 = client.propose(&proposer, &String::from_str(&env, "P2"), &String::from_str(&env, "D"));
+
+        let pending = client.get_pending_proposals();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get(0).unwrap(), pid1);
+        assert_eq!(pending.get(1).unwrap(), pid2);
     }
 }
